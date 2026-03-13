@@ -1,0 +1,63 @@
+# Python virtual environment
+env/
+venv/
+.env
+.venv/
+
+# Playwright browser data
+**/playwright-downloads/
+**/playwright/.cache/
+**/playwright/driver/
+**/playwright/node
+**/playwright/node_modules/
+
+# Session data
+sessions/
+*_cookies.json
+login_attempts.json
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# IDE settings
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Backups and logs
+*.bak
+*.bak*
+*.log
+nohup.out
+
+# Auth proxy credentials (never commit)
+data/private_key.pem
+data/secret
+data/db
