@@ -18,12 +18,13 @@ import urllib.request
 import urllib.parse
 from aiohttp import web
 
-# Set up logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler(sys.stderr)]
-)
+# Set up logging — file handler ensures logs persist regardless of how the process is started
+_log_fmt = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+_file_handler = logging.FileHandler('/tmp/linkedin-mcp.log')
+_file_handler.setFormatter(_log_fmt)
+_stderr_handler = logging.StreamHandler(sys.stderr)
+_stderr_handler.setFormatter(_log_fmt)
+logging.basicConfig(level=logging.INFO, handlers=[_stderr_handler, _file_handler])
 logger = logging.getLogger(__name__)
 
 # Load environment variables
@@ -1582,25 +1583,43 @@ async def do_interact_post(post_url: str, action: str, comment: str = None, comp
             try:
                 # Step 1: Switch identity if company_id provided (like as company page)
                 if company_id:
-                    identity_btn = page.locator('button.social-actions-button__actor-toggle, button[aria-label*="actor"], .social-footer-social-actions button.artdeco-dropdown__trigger')
+                    identity_btn = page.locator('button.content-admin-identity-toggle-button, button[aria-label*="switching identity"]')
                     if await identity_btn.count() > 0:
                         await identity_btn.first.click()
                         await page.wait_for_timeout(1500)
-                        # Modal: "Comment, react, and repost as" — find radio for company
-                        # Try matching by aria-label or visible text containing company_id or "EcoSemantic"
-                        company_radio = page.locator(f'input[value="{company_id}"], li[data-id="{company_id}"] input, .actor-picker__list-item input')
-                        if await company_radio.count() == 0:
-                            # fallback: click the second radio (first non-personal option)
-                            company_radio = page.locator('.actor-picker__list-item input[type="radio"]').nth(1)
-                        if await company_radio.count() > 0:
-                            await company_radio.first.click()
-                            await page.wait_for_timeout(500)
-                            # Click Save button
-                            save_btn = page.locator('button:has-text("Save")')
-                            if await save_btn.count() > 0:
+                        # Modal uses name="actorSelector" radios with ids like select-self, select-ecosemantic, select-kimel-tech
+                        # Try to find the right radio by company_id or by label text
+                        try:
+                            company_radio = await page.evaluate(f"""(companyId) => {{
+                                const radios = document.querySelectorAll('input[name="actorSelector"]');
+                                for (const r of radios) {{
+                                    if (r.id === 'select-self') continue;
+                                    const li = r.closest('li');
+                                    if (!li) continue;
+                                    const text = li.innerText.toLowerCase();
+                                    if (text.includes('ecosemantic')) return r.id;
+                                }}
+                                for (const r of radios) {{
+                                    if (r.id !== 'select-self') return r.id;
+                                }}
+                                return null;
+                            }}""", company_id)
+                        except Exception as eval_err:
+                            logger.error(f"Company radio evaluate failed: {eval_err}")
+                            company_radio = None
+                        if company_radio:
+                            # Use JS click — the radio input may be hidden/styled and Playwright's click hangs
+                            await page.evaluate(f"document.getElementById('{company_radio}').click()")
+                            await page.wait_for_timeout(800)
+                            # Wait for Save button to become enabled after radio selection
+                            save_btn = page.locator('button[aria-label="Save selection"]:not([disabled]), button:has-text("Save"):not([disabled])')
+                            try:
+                                await save_btn.first.wait_for(state='visible', timeout=3000)
                                 await save_btn.first.click()
                                 await page.wait_for_timeout(1500)
-                            logger.info(f"Switched identity to company_id: {company_id}")
+                            except Exception as save_err:
+                                logger.warning(f"Save button not clickable: {save_err}")
+                            logger.info(f"Switched identity to {company_radio} (company_id: {company_id})")
                         else:
                             logger.warning("Could not find company radio in identity modal")
                     else:
