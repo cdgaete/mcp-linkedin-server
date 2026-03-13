@@ -434,7 +434,7 @@ async def list_tools():
                     "action": {"type": "string", "enum": ["like", "comment", "read"], "default": "read"},
                     "comment": {"type": "string", "description": "Comment text (required if action is 'comment')"},
                     "account": {"type": "string", "enum": ["carlos", "claudia"], "description": "Which account to use (carlos=EcoSemantic, claudia=personal)"},
-                    "company_id": {"type": "string", "description": "Company/Showcase ID to like/comment as (auto-set for carlos from LINKEDIN_CARLOS_COMPANY_ID env var). Pass any company ID to act as that page."}
+                    "company_id": {"type": "string", "description": "Company/Showcase ID to like/comment as (auto-set for carlos = EcoSemantic). Pass a specific ID to use a different page. Pass \"personal\" to force acting as the personal account instead of company."}
                 },
                 "required": ["post_url"]
             }
@@ -487,9 +487,12 @@ async def call_tool(name: str, arguments: dict):
             # Determine account and company_id
             account = arguments.get("account", "carlos")
             company_id = arguments.get("company_id")
-            
-            # Auto-set company_id for carlos if not specified
-            if account == "carlos" and not company_id:
+
+            # "personal" is a sentinel to force personal identity (no company)
+            if company_id and company_id.lower() == "personal":
+                company_id = None
+            # Auto-set company_id for carlos only if not explicitly provided
+            elif account == "carlos" and company_id is None:
                 company_id = LINKEDIN_ACCOUNTS["carlos"]["company_id"]
             
             return await do_interact_post(
