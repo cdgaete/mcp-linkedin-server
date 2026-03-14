@@ -2039,8 +2039,8 @@ async def do_create_post(content: str, company_id: str = None, account: str = No
         logger.info("Clicked Post button")
         await page.wait_for_timeout(5000)
 
-        # Verify: modal should close after successful post
-        dialog_count = await page.locator('[role="dialog"]').count()
+        # Verify: the share-creation editor should disappear after successful post
+        dialog_count = await page.locator('div.share-creation-state, div.ql-editor').count()
         actor = f"company:{company_id}" if company_id else f"personal:{account}"
         await save_cookies(page)
 
