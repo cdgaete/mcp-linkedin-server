@@ -656,6 +656,15 @@ async def create_linkedin_post(
     return _extract(await do_create_post(content, resolved_company, account))
 
 
+@mcp.tool()
+async def delete_linkedin_post(
+    post_url: str,
+    account: Literal["carlos", "claudia"] = "carlos",
+) -> str:
+    """Delete a LinkedIn post by its URL. Works for both personal and company posts. The post URL should be in the format https://www.linkedin.com/feed/update/urn:li:activity:... or https://www.linkedin.com/posts/..."""
+    return _extract(await do_delete_post(post_url, account))
+
+
 # ---------------------------------------------------------------------------
 # Auth webhook server
 # Runs on AUTH_WEBHOOK_PORT alongside the MCP stdio server.
@@ -2057,6 +2066,69 @@ async def do_create_post(content: str, company_id: str = None, account: str = No
                 "action": "create_post",
                 "message": f"Post button clicked as {actor} but dialog may still be open"
             }))]
+
+
+async def do_delete_post(post_url: str, account: str = None):
+    """Delete a LinkedIn post by navigating to its URL.
+
+    Tested flow:
+      1. Navigate to post URL
+      2. Click ••• menu (feed-shared-control-menu__trigger)
+      3. Click "Delete post" from dropdown
+      4. Click "Delete" in confirmation dialog
+    """
+    if 'linkedin.com' not in post_url:
+        return [TextContent(type="text", text=json.dumps({"status": "error", "message": "Invalid LinkedIn URL"}))]
+
+    if err := require_session(account):
+        return err
+
+    async with BrowserSession(headless=True, account=account) as session:
+        page = await session.new_page(post_url)
+
+        if 'login' in page.url:
+            return [TextContent(type="text", text=json.dumps({"status": "error", "message": f"Not logged in for account: {account}"}))]
+
+        await page.wait_for_timeout(5000)
+
+        # Step 1: Click ••• menu
+        menu_btn = page.locator('button.feed-shared-control-menu__trigger')
+        if await menu_btn.count() == 0:
+            await save_cookies(page)
+            return [TextContent(type="text", text=json.dumps({"status": "error", "message": "Could not find post control menu (•••). You may not own this post."}))]
+
+        await menu_btn.first.click()
+        await page.wait_for_timeout(1500)
+
+        # Step 2: Click "Delete post"
+        delete_item = page.locator('.artdeco-dropdown__content--is-open >> text="Delete post"')
+        if await delete_item.count() == 0:
+            await page.keyboard.press("Escape")
+            await save_cookies(page)
+            return [TextContent(type="text", text=json.dumps({"status": "error", "message": "No 'Delete post' option in menu. You may not own this post."}))]
+
+        await delete_item.first.click()
+        await page.wait_for_timeout(2000)
+
+        # Step 3: Confirm deletion
+        confirm_btn = page.locator(
+            '[role="alertdialog"] button:has-text("Delete"), '
+            '[role="dialog"] button.artdeco-button--primary:has-text("Delete")'
+        )
+        if await confirm_btn.count() == 0:
+            await save_cookies(page)
+            return [TextContent(type="text", text=json.dumps({"status": "error", "message": "Confirmation dialog did not appear"}))]
+
+        await confirm_btn.first.click()
+        await page.wait_for_timeout(3000)
+        logger.info(f"Deleted post: {post_url}")
+        await save_cookies(page)
+
+        return [TextContent(type="text", text=json.dumps({
+            "status": "success",
+            "action": "delete_post",
+            "message": f"Post deleted: {post_url}"
+        }))]
 
 
 if __name__ == "__main__":
