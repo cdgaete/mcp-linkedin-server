@@ -566,13 +566,13 @@ async def login_linkedin_save(account: Literal["carlos", "claudia"] = "carlos") 
 
 @mcp.tool()
 async def browse_linkedin_feed(count: int = 5, max_age_days: int = 0) -> str:
-    """Browse LinkedIn feed and return recent posts. Use max_age_days to filter old posts."""
+    """Browse the logged-in user's LinkedIn home feed. Returns recent posts with author, content, date, reactions, comments, and post URL. Use max_age_days to exclude older posts (e.g., max_age_days=7 for last week only)."""
     return _extract(await do_browse_feed(count, max_age_days))
 
 
 @mcp.tool()
 async def search_linkedin_profiles(query: str, count: int = 5) -> str:
-    """Search for LinkedIn profiles matching a query."""
+    """Search for LinkedIn profiles by name, title, company, or keywords. Returns name, headline, location, profile URL, and connection degree. Use view_linkedin_profile to get full details on a result."""
     return _extract(await do_search_profiles(query, count))
 
 
@@ -586,12 +586,19 @@ async def search_linkedin_posts(
     author_name: Optional[str] = None,
     account: Literal["carlos", "claudia"] = "carlos",
 ) -> str:
-    """Search for LinkedIn posts by keywords. Supports filters:
-    - date_posted: 'past-24h', 'past-week', 'past-month' (LinkedIn native filter)
+    """Search LinkedIn posts by keywords. Returns author, author_profile URL, date, content, reactions, and comments for each post.
+
+    IMPORTANT: Search results do NOT include post URLs (LinkedIn limitation). Each result includes an author_profile link.
+    To get the actual post URL (needed for like/comment/read), follow this workflow:
+      1. search_linkedin_posts → find the post you want
+      2. get_linkedin_posts(author_profile) → get post URLs with activity URNs from that author
+      3. interact_with_linkedin_post(post_url, action) → like, comment, or read the full post
+
+    Filters:
+    - date_posted: 'past-24h', 'past-week', 'past-month' — applied server-side by LinkedIn
     - sort_by: 'relevance' (default) or 'date_posted' (latest first)
-    - author_name: client-side filter by author name (partial, case-insensitive)
-    - max_age_days: client-side age filter (legacy, prefer date_posted)
-    Note: post URLs are not available from search results; use get_linkedin_posts on the author's profile to find specific post URLs."""
+    - author_name: client-side partial match on author name (case-insensitive). Filters AFTER fetching results.
+    - max_age_days: legacy client-side age filter. Prefer date_posted for better results."""
     return _extract(await do_search_posts(query, count, max_age_days, date_posted, sort_by, author_name, account))
 
 
@@ -605,7 +612,10 @@ async def search_linkedin_posts_async(
     author_name: Optional[str] = None,
     account: Literal["carlos", "claudia"] = "carlos",
 ) -> str:
-    """Start a LinkedIn post search in the background. Returns a task_id immediately. Poll get_search_task_status with the task_id to retrieve results when done (~15s). Supports same filters as search_linkedin_posts."""
+    """Non-blocking version of search_linkedin_posts. Use when you want to avoid blocking the conversation for ~10-15 seconds.
+    Returns a task_id immediately. Poll get_search_task_status(task_id) every 3-5 seconds until status='done'.
+    Supports all the same filters as search_linkedin_posts (date_posted, sort_by, author_name, max_age_days).
+    The result format is identical to search_linkedin_posts."""
     task_id = str(_uuid.uuid4())
     _search_tasks[task_id] = {"status": "pending", "result": None}
 
@@ -622,7 +632,7 @@ async def search_linkedin_posts_async(
 
 @mcp.tool()
 async def get_search_task_status(task_id: str) -> str:
-    """Poll the status of a search_linkedin_posts_async task. Returns status=pending while running, status=done with full posts list when complete, or status=error."""
+    """Check the result of a search_linkedin_posts_async task. Returns status='pending' (keep polling), status='done' (result.posts contains the posts), or status='error'. Poll every 3-5 seconds."""
     task = _search_tasks.get(task_id)
     if not task:
         return json.dumps({"status": "error", "message": f"Unknown task_id: {task_id}"})
@@ -631,13 +641,18 @@ async def get_search_task_status(task_id: str) -> str:
 
 @mcp.tool()
 async def view_linkedin_profile(profile_url: str) -> str:
-    """Visit and extract data from a LinkedIn profile URL."""
+    """Extract full profile data from a LinkedIn profile URL: name, headline, location, about section, experience, education, skills. Pass a URL like 'https://www.linkedin.com/in/carlosgaete/'."""
     return _extract(await do_view_profile(profile_url))
 
 
 @mcp.tool()
 async def get_linkedin_posts(profile_url: str, count: int = 5) -> str:
-    """Get posts from a LinkedIn profile or company page with their URLs and URNs. Pass a full URL, a path like 'company/ecosemantic' or 'in/carlosgaete', or just a slug like 'ecosemantic'."""
+    """Get recent posts from a LinkedIn profile or company page. Returns post URLs (with activity URNs) and content previews.
+    This is the KEY tool for resolving post URLs — search_linkedin_posts finds posts but cannot return URLs;
+    use this tool on the author_profile from search results to get the actual post URL needed for interact_with_linkedin_post.
+
+    Accepts: full URL, path like 'company/ecosemantic' or 'in/carlosgaete', or just a slug like 'ecosemantic' (defaults to company page).
+    Works best for 1st-degree connections and company pages you manage. May return fewer results for 2nd+ degree connections."""
     return _extract(await do_get_posts(profile_url, count))
 
 
@@ -649,7 +664,11 @@ async def interact_with_linkedin_post(
     account: Literal["carlos", "claudia"] = "carlos",
     company_id: Optional[str] = None,
 ) -> str:
-    """Interact with a LinkedIn post (like, comment, or read). Use 'account' to select which LinkedIn account (carlos or claudia). Use 'company_id' to like/comment as a company page (auto-set for carlos = EcoSemantic). Pass 'personal' to force acting as the personal account instead of company."""
+    """Read, like, or comment on a LinkedIn post. Requires a post URL (get it from get_linkedin_posts or browse_linkedin_feed).
+    - action='read': extract full post content, author details, and all comments
+    - action='like': like the post
+    - action='comment': post a comment (requires 'comment' text)
+    By default, carlos acts as the EcoSemantic company page. Pass company_id='personal' to act as the personal account."""
     # "personal" is a sentinel to force personal identity (no company)
     resolved_company = company_id
     if resolved_company and resolved_company.lower() == "personal":
@@ -669,7 +688,10 @@ async def create_linkedin_post(
     company_id: Optional[str] = None,
     group_name: Optional[str] = None,
 ) -> str:
-    """Publish a new LinkedIn post. Use 'account' to select which LinkedIn account. Use 'company_id' to post as a company page (auto-set for carlos = EcoSemantic). Pass 'personal' to force posting as the personal account. Use 'group_name' to post to a LinkedIn group (partial match, case-insensitive). Group posts are always as the personal account. Use list_linkedin_groups to see available groups."""
+    """Publish a new LinkedIn post. By default, carlos posts as the EcoSemantic company page.
+    - company_id='personal': post as the personal account instead of company page
+    - group_name: post to a LinkedIn group (partial match, case-insensitive). Group posts are always personal. Use list_linkedin_groups to see available groups.
+    - account: 'carlos' or 'claudia' — selects which LinkedIn session to use."""
     if group_name:
         # Group posts are always personal — ignore company_id
         return _extract(await do_create_post(content, None, account, group_name=group_name))
@@ -686,13 +708,15 @@ async def delete_linkedin_post(
     post_url: str,
     account: Literal["carlos", "claudia"] = "carlos",
 ) -> str:
-    """Delete a LinkedIn post by its URL. Works for both personal and company posts. The post URL should be in the format https://www.linkedin.com/feed/update/urn:li:activity:... or https://www.linkedin.com/posts/..."""
+    """Delete a LinkedIn post by URL. Works for both personal and company posts. Accepts URLs in format:
+    - https://www.linkedin.com/feed/update/urn:li:activity:...
+    - https://www.linkedin.com/posts/..."""
     return _extract(await do_delete_post(post_url, account))
 
 
 @mcp.tool()
 async def list_linkedin_groups(account: Literal["carlos", "claudia"] = "carlos") -> str:
-    """List all LinkedIn groups the account is a member of. Returns group names, URNs, and public/private status."""
+    """List all LinkedIn groups the account belongs to. Returns group name, URN, and visibility (Public/Private). Use the group_name parameter in create_linkedin_post to post to a specific group."""
     return _extract(await do_list_groups(account))
 
 
