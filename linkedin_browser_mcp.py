@@ -1386,19 +1386,56 @@ async def do_search_posts(
             await page.wait_for_timeout(1500)
             logger.info(f"Scroll {scroll_i+1}/{max_scrolls}")
 
-        # Extract main text
-        main_text = await page.evaluate(r'''() => {
+        # Extract main text + author slugs (via Y-position mapping)
+        extraction = await page.evaluate(r'''() => {
             const main = document.querySelector('main');
-            return main ? main.innerText : '';
+            if (!main) return {text: '', slugs: []};
+            const text = main.innerText;
+
+            // Find "Feed post" screen-reader markers and their Y positions
+            const markers = [];
+            const walker = document.createTreeWalker(main, NodeFilter.SHOW_TEXT, {
+                acceptNode: (n) => n.textContent.trim() === 'Feed post' ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT
+            });
+            while (walker.nextNode()) {
+                markers.push(walker.currentNode.parentElement.getBoundingClientRect().top);
+            }
+            markers.sort((a, b) => a - b);
+
+            // Collect all profile/company links with Y positions
+            const links = [];
+            main.querySelectorAll('a[href*="/in/"], a[href*="/company/"]').forEach(a => {
+                const href = a.href;
+                const y = a.getBoundingClientRect().top;
+                const isCompany = href.includes('/company/');
+                const slug = isCompany
+                    ? (href.match(/\/company\/([^/?]+)/)?.[1] || null)
+                    : (href.match(/\/in\/([^/?]+)/)?.[1] || null);
+                if (slug) links.push({y, slug, isCompany});
+            });
+            links.sort((a, b) => a.y - b.y);
+
+            // For each marker, find the first link after it (before next marker)
+            const slugs = [];
+            for (let i = 0; i < markers.length; i++) {
+                const nextY = i + 1 < markers.length ? markers[i + 1] : Infinity;
+                const link = links.find(l => l.y > markers[i] && l.y < nextY);
+                slugs.push(link ? {slug: link.slug, isCompany: link.isCompany} : null);
+            }
+
+            return {text, slugs};
         }''')
+
+        main_text = extraction['text']
+        author_slugs = extraction['slugs']
 
         await save_cookies(page)
 
     if not main_text:
         return [TextContent(type="text", text=json.dumps({"status": "error", "message": "No content on search results page"}))]
 
-    # Parse posts from DOM text
-    posts = _parse_search_posts(main_text)
+    # Parse posts from DOM text with author slugs
+    posts = _parse_search_posts(main_text, author_slugs)
     logger.info(f"search_posts_v2 parsed {len(posts)} posts")
 
     # Client-side author filter
@@ -1424,13 +1461,13 @@ async def do_search_posts(
     }, indent=2))]
 
 
-def _parse_search_posts(main_text: str) -> list[dict]:
+def _parse_search_posts(main_text: str, author_slugs: list[dict | None] = None) -> list[dict]:
     """Parse LinkedIn search results from main.innerText into structured post dicts."""
     raw_blocks = re.split(r'(?:^|\n)Feed post\n', main_text)
     raw_blocks = [b for b in raw_blocks[1:] if b.strip()]
 
     posts = []
-    for block in raw_blocks:
+    for block_idx, block in enumerate(raw_blocks):
         lines = block.strip().split('\n')
 
         # Author: first non-empty line (skip "Feed post" artifacts)
@@ -1488,11 +1525,21 @@ def _parse_search_posts(main_text: str) -> list[dict]:
 
         date_info = parse_linkedin_date(date_raw)
 
+        # Author slug from Y-position mapping
+        slug_info = author_slugs[block_idx] if author_slugs and block_idx < len(author_slugs) else None
+
         if not content and not author:
             continue
 
+        if slug_info:
+            prefix = "company" if slug_info.get("isCompany") else "in"
+            author_profile = f"https://www.linkedin.com/{prefix}/{slug_info['slug']}/"
+        else:
+            author_profile = None
+
         posts.append({
             "author": author,
+            "author_profile": author_profile,
             "date": date_raw,
             "age_days": date_info[1],
             "parsed_date": date_info[0].strftime('%Y-%m-%d'),
