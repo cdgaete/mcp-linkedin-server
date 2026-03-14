@@ -577,25 +577,46 @@ async def search_linkedin_profiles(query: str, count: int = 5) -> str:
 
 
 @mcp.tool()
-async def search_linkedin_posts(query: str, count: int = 5, max_age_days: int = 0) -> str:
-    """Search for LinkedIn posts by keywords. Use max_age_days to filter old posts."""
-    return _extract(await do_search_posts(query, count, max_age_days))
+async def search_linkedin_posts(
+    query: str,
+    count: int = 5,
+    max_age_days: int = 0,
+    date_posted: Optional[Literal["past-24h", "past-week", "past-month"]] = None,
+    sort_by: Optional[Literal["relevance", "date_posted"]] = None,
+    author_name: Optional[str] = None,
+    account: Literal["carlos", "claudia"] = "carlos",
+) -> str:
+    """Search for LinkedIn posts by keywords. Supports filters:
+    - date_posted: 'past-24h', 'past-week', 'past-month' (LinkedIn native filter)
+    - sort_by: 'relevance' (default) or 'date_posted' (latest first)
+    - author_name: client-side filter by author name (partial, case-insensitive)
+    - max_age_days: client-side age filter (legacy, prefer date_posted)
+    Note: post URLs are not available from search results; use get_linkedin_posts on the author's profile to find specific post URLs."""
+    return _extract(await do_search_posts(query, count, max_age_days, date_posted, sort_by, author_name, account))
 
 
 @mcp.tool()
-async def search_linkedin_posts_async(query: str, count: int = 5, max_age_days: int = 0) -> str:
-    """Start a LinkedIn post search in the background. Returns a task_id immediately. Poll get_search_task_status with the task_id to retrieve results when done (~9s)."""
+async def search_linkedin_posts_async(
+    query: str,
+    count: int = 5,
+    max_age_days: int = 0,
+    date_posted: Optional[Literal["past-24h", "past-week", "past-month"]] = None,
+    sort_by: Optional[Literal["relevance", "date_posted"]] = None,
+    author_name: Optional[str] = None,
+    account: Literal["carlos", "claudia"] = "carlos",
+) -> str:
+    """Start a LinkedIn post search in the background. Returns a task_id immediately. Poll get_search_task_status with the task_id to retrieve results when done (~15s). Supports same filters as search_linkedin_posts."""
     task_id = str(_uuid.uuid4())
     _search_tasks[task_id] = {"status": "pending", "result": None}
 
-    async def _run_search(tid, q, c, m):
+    async def _run_search(tid, q, c, m, dp, sb, an, acc):
         try:
-            result = await do_search_posts(q, c, m)
+            result = await do_search_posts(q, c, m, dp, sb, an, acc)
             _search_tasks[tid] = {"status": "done", "result": json.loads(result[0].text)}
         except Exception as e:
             _search_tasks[tid] = {"status": "error", "result": {"message": str(e)}}
 
-    asyncio.create_task(_run_search(task_id, query, count, max_age_days))
+    asyncio.create_task(_run_search(task_id, query, count, max_age_days, date_posted, sort_by, author_name, account))
     return json.dumps({"task_id": task_id, "status": "pending"})
 
 
@@ -1321,171 +1342,157 @@ async def do_search_profiles(query: str, count: int):
         }, indent=2))]
 
 
-async def do_search_posts(query: str, count: int, max_age_days: int = 0):
-    """Search LinkedIn posts via Voyager API — parses JSON directly, no DOM positional matching."""
+async def do_search_posts(
+    query: str, count: int, max_age_days: int = 0,
+    date_posted: str | None = None, sort_by: str | None = None,
+    author_name: str | None = None, account: str = "carlos",
+):
+    """Search LinkedIn posts via DOM text parsing with native URL filters."""
     import urllib.parse as _up
-    import httpx
 
-    if err := require_session(): return err
+    if err := require_session(account): return err
 
-    encoded_query = _up.quote(query)
+    # Build search URL with LinkedIn native filters
+    params = {"keywords": query, "origin": "FACETED_SEARCH"}
+    if date_posted:
+        params["datePosted"] = f'"{date_posted}"'
+    if sort_by:
+        params["sortBy"] = f'"{sort_by}"'
+    url = "https://www.linkedin.com/search/results/content/?" + _up.urlencode(params, quote_via=_up.quote)
+    logger.info(f"search_posts_v2 URL: {url}")
 
-    async with BrowserSession(headless=True) as session:
+    async with BrowserSession(headless=True, account=account) as session:
         page = await session.new_page()
-
-        # Navigate and intercept the Voyager graphql search response in-flight.
-        captured_query_id: str | None = None
-        intercepted_body: str | None = None
-
-        try:
-            async with page.expect_response(
-                lambda r: 'voyager/api/graphql' in r.url and 'sortOrder' in r.url,
-                timeout=15000
-            ) as voyager_info:
-                await page.goto(
-                    f'https://www.linkedin.com/search/results/content/?keywords={encoded_query}',
-                    wait_until='domcontentloaded',
-                    timeout=60000,
-                )
-            voyager_resp = await voyager_info.value
-            intercepted_body = await voyager_resp.text()
-            qid_m = re.search(r'queryId=([^&]+)', voyager_resp.url)
-            if qid_m:
-                captured_query_id = qid_m.group(1)
-        except Exception as nav_err:
-            logger.error(f"Navigation/Voyager intercept failed: {nav_err}")
-            return [TextContent(type="text", text=json.dumps({"status": "error", "message": f"Navigation failed: {nav_err}"}))]
+        await page.goto(url, wait_until='domcontentloaded', timeout=60000)
 
         if 'login' in page.url:
             return [TextContent(type="text", text=json.dumps({"status": "error", "message": "Not logged in"}))]
 
-        # Always make a direct Voyager API call — this is the authoritative source.
-        # The intercepted response may only have count:3; the direct call gets count+2.
-        cookies = await page.context.cookies()
-        cookie_header = '; '.join(
-            f"{c['name']}={c['value']}" for c in cookies
-            if 'linkedin.com' in c.get('domain', '')
-        )
-        jsessionid = next((c['value'] for c in cookies if c['name'] == 'JSESSIONID'), '')
-        csrf_token = jsessionid.strip('"')
-        query_id = captured_query_id or 'voyagerSearchDashClusters.b0928897b71bd00a5a7291755dcd64f0'
-        direct_count = min(count + 2, 10)
+        await page.wait_for_timeout(5000)
 
-        voyager_url = (
-            f'https://www.linkedin.com/voyager/api/graphql'
-            f'?includeWebMetadata=true'
-            f'&variables=(start:0,count:{direct_count},sortOrder:RELEVANCE,'
-            f'keywords:{encoded_query},origin:SWITCH_SEARCH_VERTICAL,'
-            f'flagshipSearchIntent:SEARCH_SRP)'
-            f'&queryId={query_id}'
-        )
-        headers = {
-            'csrf-token': csrf_token,
-            'x-restli-protocol-version': '2.0.0',
-            'x-li-lang': 'en_US',
-            'x-li-track': '{"clientVersion":"1.13.10097"}',
-            'accept': 'application/vnd.linkedin.normalized+json+2.1',
-            'cookie': cookie_header,
+        # Scroll to load more posts if needed
+        max_scrolls = max(0, (count - 5) // 5) + 1
+        if count <= 6:
+            max_scrolls = 0
+        for scroll_i in range(max_scrolls):
+            await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
+            await page.wait_for_timeout(3000)
+            # Click "Load more" button if present
+            await page.evaluate(r'''() => {
+                const btns = [...document.querySelectorAll('button')];
+                const lb = btns.find(b => b.innerText.trim().toLowerCase() === 'load more');
+                if (lb) lb.click();
+            }''')
+            await page.wait_for_timeout(1500)
+            logger.info(f"Scroll {scroll_i+1}/{max_scrolls}")
+
+        # Extract main text
+        main_text = await page.evaluate(r'''() => {
+            const main = document.querySelector('main');
+            return main ? main.innerText : '';
+        }''')
+
+        await save_cookies(page)
+
+    if not main_text:
+        return [TextContent(type="text", text=json.dumps({"status": "error", "message": "No content on search results page"}))]
+
+    # Parse posts from DOM text
+    posts = _parse_search_posts(main_text)
+    logger.info(f"search_posts_v2 parsed {len(posts)} posts")
+
+    # Client-side author filter
+    if author_name:
+        author_lower = author_name.lower()
+        posts = [p for p in posts if author_lower in p["author"].lower()]
+
+    # Client-side age filter (legacy)
+    if max_age_days > 0:
+        posts = [p for p in posts if p["age_days"] <= max_age_days]
+
+    return [TextContent(type="text", text=json.dumps({
+        "status": "success",
+        "posts": posts[:count],
+        "total_found": len(posts),
+        "query": query,
+        "filters": {
+            "date_posted": date_posted,
+            "sort_by": sort_by,
+            "author_name": author_name,
+            "max_age_days": max_age_days if max_age_days > 0 else None,
         }
+    }, indent=2))]
 
-        try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.get(voyager_url, headers=headers, timeout=15)
-            voyager_body = resp.text
-        except Exception as api_err:
-            logger.error(f"Direct Voyager API call failed: {api_err}")
-            return [TextContent(type="text", text=json.dumps({"status": "error", "message": f"Voyager API call failed: {api_err}"}))]
 
-        # Parse Voyager normalized JSON — extract Update items which contain all post data.
-        try:
-            data = json.loads(voyager_body)
-        except Exception:
-            return [TextContent(type="text", text=json.dumps({"status": "error", "message": "Failed to parse Voyager response"}))]
+def _parse_search_posts(main_text: str) -> list[dict]:
+    """Parse LinkedIn search results from main.innerText into structured post dicts."""
+    raw_blocks = re.split(r'(?:^|\n)Feed post\n', main_text)
+    raw_blocks = [b for b in raw_blocks[1:] if b.strip()]
 
-        included = data.get('included', [])
+    posts = []
+    for block in raw_blocks:
+        lines = block.strip().split('\n')
 
-        # Build lookup: activity_id -> SocialActivityCounts
-        social_counts: dict = {}
-        for inc in included:
-            if inc.get('$type') == 'com.linkedin.voyager.dash.feed.SocialActivityCounts':
-                urn = inc.get('urn', '')
-                aid_m = re.search(r'urn:li:activity:(\d+)', urn)
-                if aid_m:
-                    social_counts[aid_m.group(1)] = inc
+        # Author: first non-empty line (skip "Feed post" artifacts)
+        author = ''
+        for line in lines:
+            line = line.strip()
+            if line and line != 'Feed post':
+                author = line
+                break
+        # Clean author name
+        author = re.sub(r'\s*(Verified|Premium)\s*Profile\s*', '', author).strip()
+        author = re.sub(r'\s*\d+(st|nd|rd|th)\+?\s*$', '', author).strip()
+        author = re.sub(r'\s*,\s*Open to work\s*', '', author).strip()
 
-        posts = []
+        # Date: relative time pattern in header (before "Follow")
+        date_raw = ''
+        follow_pos = block.find('\nFollow\n')
+        header = block[:follow_pos] if follow_pos > 0 else block[:300]
+        date_m = re.search(r'\n(\d+(?:m|min|h|d|w|mo|yr))\s*(?:•|$)', header, re.MULTILINE)
+        if date_m:
+            date_raw = date_m.group(1)
+        elif re.search(r'just now', header, re.IGNORECASE):
+            date_raw = '0m'
 
-        for item in included:
-            if item.get('$type') != 'com.linkedin.voyager.dash.feed.Update':
-                continue
+        # Content: between "Follow\n" and social action buttons
+        content = ''
+        if follow_pos >= 0:
+            after = block[follow_pos + len('\nFollow\n'):]
+            end_pos = len(after)
+            for pat in [r'\n\d+ reactions?\n', r'\n\d+ comments?\n', r'\nLike\nComment\nRepost\nSend']:
+                m = re.search(pat, after)
+                if m and m.start() < end_pos:
+                    end_pos = m.start()
+            content = after[:end_pos].strip()
+            content = re.sub(r'\nhashtag\n', '\n', content)
+            content = re.sub(r'\n… more\s*$', '', content).strip()
 
-            try:
-                # Activity URN → URL
-                backend_urn = item.get('metadata', {}).get('backendUrn', '')
-                activity_id_m = re.search(r'urn:li:activity:(\d+)', backend_urn)
-                if not activity_id_m:
-                    continue
-                activity_id = activity_id_m.group(1)
-                url = f'https://www.linkedin.com/feed/update/urn:li:activity:{activity_id}/'
+        # Engagement counts
+        reactions = 0
+        r_m = re.search(r'(\d+)\s+reactions?', block)
+        if r_m: reactions = int(r_m.group(1))
+        comments = 0
+        c_m = re.search(r'(\d+)\s+comments?', block)
+        if c_m: comments = int(c_m.group(1))
 
-                # Author name from actor component
-                actor = item.get('actor', {})
-                author = actor.get('name', {}).get('text', 'Unknown')
-                author = re.sub(r'\d+(st|nd|rd|th)\+?', '', author)
-                author = re.sub(r'\s*•.*', '', author).strip()
+        date_info = parse_linkedin_date(date_raw)
 
-                # Date from actor subDescription
-                sub_desc = actor.get('subDescription', {}).get('text', '')
-                date_m = re.match(r'^(\d+(?:mo|d|h|w|yr))', sub_desc.strip())
-                date = date_m.group(1) if date_m else sub_desc.split('•')[0].strip()
+        if not content and not author:
+            continue
 
-                # Post content from commentary; fall back to resharedUpdate
-                commentary = item.get('commentary') or {}
-                content = commentary.get('text', {}).get('text', '') or ''
-                if not content:
-                    reshared = item.get('resharedUpdate') or {}
-                    content = ((reshared.get('commentary') or {}).get('text') or {}).get('text', '') or ''
+        posts.append({
+            "author": author,
+            "date": date_raw,
+            "age_days": date_info[1],
+            "parsed_date": date_info[0].strftime('%Y-%m-%d'),
+            "content": content[:2000],
+            "reactions": reactions,
+            "comments": comments,
+            "url": None,
+        })
 
-                # Social counts matched by activity_id
-                sc = social_counts.get(activity_id, {})
-                num_likes = sc.get('numLikes', 0) or 0
-                num_comments = sc.get('numComments', 0) or 0
-                num_shares = sc.get('numShares', 0) or 0
-
-                if not content and author == 'Unknown':
-                    continue
-
-                posts.append({
-                    'url': url,
-                    'author': author,
-                    'date': date,
-                    'content': content[:1200],
-                    'reactions': num_likes,
-                    'comments': num_comments,
-                    'shares': num_shares,
-                })
-
-            except Exception as parse_err:
-                logger.debug(f"Skipping Update item: {parse_err}")
-                continue
-
-        logger.info(f"Voyager JSON parsed: {len(posts)} posts from {len(included)} included items")
-
-        if max_age_days > 0:
-            posts = filter_posts_by_age(posts, max_age_days)
-        else:
-            for post in posts:
-                parsed_date, age_days = parse_linkedin_date(post.get('date', ''))
-                post['parsed_date'] = parsed_date.strftime('%Y-%m-%d')
-                post['age_days'] = age_days
-
-        return [TextContent(type="text", text=json.dumps({
-            "status": "success",
-            "posts": posts[:count],
-            "total_found": len(posts),
-            "max_age_days": max_age_days,
-            "query": query
-        }, indent=2))]
+    return posts
 
 async def do_view_profile(profile_url: str):
     """View a LinkedIn profile - Updated selectors"""
