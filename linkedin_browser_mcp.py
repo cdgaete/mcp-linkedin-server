@@ -646,8 +646,12 @@ async def create_linkedin_post(
     content: str,
     account: Literal["carlos", "claudia"] = "carlos",
     company_id: Optional[str] = None,
+    group_name: Optional[str] = None,
 ) -> str:
-    """Publish a new LinkedIn post. Use 'account' to select which LinkedIn account. Use 'company_id' to post as a company page (auto-set for carlos = EcoSemantic). Pass 'personal' to force posting as the personal account."""
+    """Publish a new LinkedIn post. Use 'account' to select which LinkedIn account. Use 'company_id' to post as a company page (auto-set for carlos = EcoSemantic). Pass 'personal' to force posting as the personal account. Use 'group_name' to post to a LinkedIn group (partial match, case-insensitive). Group posts are always as the personal account. Use list_linkedin_groups to see available groups."""
+    if group_name:
+        # Group posts are always personal — ignore company_id
+        return _extract(await do_create_post(content, None, account, group_name=group_name))
     resolved_company = company_id
     if resolved_company and resolved_company.lower() == "personal":
         resolved_company = None
@@ -663,6 +667,12 @@ async def delete_linkedin_post(
 ) -> str:
     """Delete a LinkedIn post by its URL. Works for both personal and company posts. The post URL should be in the format https://www.linkedin.com/feed/update/urn:li:activity:... or https://www.linkedin.com/posts/..."""
     return _extract(await do_delete_post(post_url, account))
+
+
+@mcp.tool()
+async def list_linkedin_groups(account: Literal["carlos", "claudia"] = "carlos") -> str:
+    """List all LinkedIn groups the account is a member of. Returns group names, URNs, and public/private status."""
+    return _extract(await do_list_groups(account))
 
 
 # ---------------------------------------------------------------------------
@@ -1945,12 +1955,13 @@ async def do_interact_post(post_url: str, action: str, comment: str = None, comp
         }, indent=2))]
 
 
-async def do_create_post(content: str, company_id: str = None, account: str = None):
-    """Create a new LinkedIn post, optionally as a company page.
+async def do_create_post(content: str, company_id: str = None, account: str = None, group_name: str = None):
+    """Create a new LinkedIn post, optionally as a company page or to a group.
 
     Proven flow (tested step-by-step):
       1. Navigate to /feed/, click "Start a post"
-      2. If company_id: settings button > actor toggle > select radio > Save > Done
+      2a. If group_name: settings > Group radio > match group > select > Save > Done
+      2b. Elif company_id: settings button > actor toggle > select radio > Save > Done
       3. Type content into ql-editor via keyboard.type()
       4. Click Post button (share-actions__primary-action)
     """
@@ -1978,8 +1989,60 @@ async def do_create_post(content: str, company_id: str = None, account: str = No
         await page.wait_for_timeout(2000)
         logger.info("Opened post editor modal")
 
-        # --- Step 2: Switch identity if company page requested ---
-        if company_id:
+        # --- Step 2a: Select group if group_name provided ---
+        if group_name:
+            try:
+                # Open Post settings
+                await page.locator('button.share-unified-settings-entry-button').first.click()
+                await page.wait_for_timeout(2000)
+
+                # Click the Group visibility radio
+                await page.evaluate("document.getElementById('sharing-shared-generic-list-radio-CONTAINER').click()")
+                await page.wait_for_timeout(2000)
+
+                # Find matching group radio by name (case-insensitive partial match)
+                matched = await page.evaluate(f"""(target) => {{
+                    const radios = document.querySelectorAll('input[type="radio"][id*="fsd_group"]');
+                    for (const r of radios) {{
+                        const li = r.closest('li') || r.parentElement;
+                        if (li && li.innerText.toLowerCase().includes(target.toLowerCase())) {{
+                            return {{id: r.id, name: li.innerText.trim().split('\\n')[0].trim()}};
+                        }}
+                    }}
+                    return null;
+                }}""", group_name)
+
+                if not matched:
+                    await save_cookies(page)
+                    return [TextContent(type="text", text=json.dumps({
+                        "status": "error",
+                        "message": f"No group matching '{group_name}' found. Use list_linkedin_groups to see available groups."
+                    }))]
+
+                # Select the matched group
+                await page.evaluate(f"document.getElementById('{matched['id']}').click()")
+                await page.wait_for_timeout(1000)
+
+                # Click Save
+                save_btn = page.locator('button.share-box-footer__primary-btn:has-text("Save")')
+                await save_btn.first.click()
+                await page.wait_for_timeout(2000)
+
+                # Click Done to return to editor
+                await page.locator('button:has-text("Done")').first.click()
+                await page.wait_for_timeout(2000)
+                logger.info(f"Selected group: {matched['name']} ({matched['id']})")
+
+            except Exception as e:
+                logger.warning(f"Group selection failed: {e} — aborting")
+                await save_cookies(page)
+                return [TextContent(type="text", text=json.dumps({
+                    "status": "error",
+                    "message": f"Group selection failed: {e}"
+                }))]
+
+        # --- Step 2b: Switch identity if company page requested (skip if group) ---
+        elif company_id:
             try:
                 # 2a. Open Post settings
                 await page.locator('button.share-unified-settings-entry-button').first.click()
@@ -2050,7 +2113,7 @@ async def do_create_post(content: str, company_id: str = None, account: str = No
 
         # Verify: the share-creation editor should disappear after successful post
         dialog_count = await page.locator('div.share-creation-state, div.ql-editor').count()
-        actor = f"company:{company_id}" if company_id else f"personal:{account}"
+        actor = f"group:{group_name}" if group_name else (f"company:{company_id}" if company_id else f"personal:{account}")
         await save_cookies(page)
 
         if dialog_count == 0:
@@ -2066,6 +2129,63 @@ async def do_create_post(content: str, company_id: str = None, account: str = No
                 "action": "create_post",
                 "message": f"Post button clicked as {actor} but dialog may still be open"
             }))]
+
+
+async def do_list_groups(account: str = None):
+    """List all LinkedIn groups the account is a member of.
+
+    Flow: Open editor → Post settings → Group radio → scrape group list → close.
+    """
+    if err := require_session(account):
+        return err
+
+    async with BrowserSession(headless=True, account=account) as session:
+        page = await session.new_page("https://www.linkedin.com/feed/")
+
+        if 'login' in page.url:
+            return [TextContent(type="text", text=json.dumps({"status": "error", "message": f"Not logged in for account: {account}"}))]
+
+        await page.wait_for_timeout(3000)
+
+        # Open editor
+        start_btn = page.locator('button:has-text("Start a post")')
+        if await start_btn.count() == 0:
+            await save_cookies(page)
+            return [TextContent(type="text", text=json.dumps({"status": "error", "message": "Could not find 'Start a post' button"}))]
+
+        await start_btn.first.click()
+        await page.wait_for_timeout(2000)
+
+        # Open Post settings
+        await page.locator('button.share-unified-settings-entry-button').first.click()
+        await page.wait_for_timeout(2000)
+
+        # Click Group radio to show group list
+        await page.evaluate("document.getElementById('sharing-shared-generic-list-radio-CONTAINER').click()")
+        await page.wait_for_timeout(2000)
+
+        # Scrape all group radios
+        groups = await page.evaluate('''() => {
+            const radios = document.querySelectorAll('input[type="radio"][id*="fsd_group"]');
+            return Array.from(radios).map(r => {
+                const li = r.closest('li') || r.parentElement;
+                const text = li ? li.innerText.trim() : "";
+                const lines = text.split('\\n').map(l => l.trim()).filter(l => l);
+                const name = lines[0] || "";
+                const visibility = lines.find(l => l === "Public" || l === "Private") || "Unknown";
+                // Extract URN from radio id: sharing-shared-generic-list-radio-urn:li:fsd_group:NNNNN
+                const urn = r.id.replace('sharing-shared-generic-list-radio-', '');
+                return {name, urn, visibility};
+            });
+        }''')
+
+        await save_cookies(page)
+        return [TextContent(type="text", text=json.dumps({
+            "status": "success",
+            "account": account,
+            "groups_count": len(groups),
+            "groups": groups
+        }, indent=2))]
 
 
 async def do_delete_post(post_url: str, account: str = None):
