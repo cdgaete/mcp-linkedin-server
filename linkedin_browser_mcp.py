@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from fastmcp import FastMCP
 from fastmcp.server.auth import AccessToken, TokenVerifier
+from fastmcp.server.server import Middleware
 from mcp.types import TextContent
 from playwright.async_api import async_playwright
 import asyncio
@@ -15,10 +16,11 @@ import logging
 import sys
 import re
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import socket
 import urllib.request
 import urllib.parse
+import aiosqlite
 from aiohttp import web
 
 # Set up logging — file handler ensures logs persist regardless of how the process is started
@@ -64,9 +66,15 @@ from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def lifespan(server):
-    """Start the auth webhook server alongside the MCP server."""
+    """Start the auth webhook server and audit DB alongside the MCP server."""
+    global _audit_db
+    _audit_db = await _init_audit_db()
+    logger.info(f"Audit DB initialized at {AUDIT_DB_PATH}")
     await start_webhook_server()
     yield
+    if _audit_db:
+        await _audit_db.close()
+        _audit_db = None
 
 mcp = FastMCP("linkedin-browser", lifespan=lifespan, auth=_auth)
 
@@ -74,6 +82,188 @@ mcp = FastMCP("linkedin-browser", lifespan=lifespan, auth=_auth)
 import uuid as _uuid
 _search_tasks: dict = {}  # task_id -> {"status": "pending"|"done"|"error", "result": ...}
 
+
+# ---------------------------------------------------------------------------
+# Audit database — records every tool call for traceability
+# ---------------------------------------------------------------------------
+AUDIT_DB_PATH = Path(__file__).parent / "data" / "audit.db"
+
+# Module-level connection holder (set during lifespan)
+_audit_db: aiosqlite.Connection | None = None
+
+# Session → clientInfo mapping (populated during initialize handshake)
+_session_client_info: dict[str, dict] = {}
+
+
+async def _init_audit_db() -> aiosqlite.Connection:
+    """Create audit DB and table if needed, return connection."""
+    AUDIT_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    db = await aiosqlite.connect(str(AUDIT_DB_PATH))
+    await db.execute("PRAGMA journal_mode=WAL")
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS tool_calls (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp   TEXT    NOT NULL,
+            tool_name   TEXT    NOT NULL,
+            parameters  TEXT,
+            response    TEXT,
+            duration_ms INTEGER,
+            status      TEXT    NOT NULL DEFAULT 'success',
+            error_message TEXT,
+            caller_id   TEXT,
+            client_name TEXT,
+            client_version TEXT,
+            session_id  TEXT,
+            ip_address  TEXT
+        )
+    """)
+    await db.execute("""
+        CREATE INDEX IF NOT EXISTS idx_tool_calls_timestamp
+        ON tool_calls(timestamp DESC)
+    """)
+    await db.execute("""
+        CREATE INDEX IF NOT EXISTS idx_tool_calls_tool_name
+        ON tool_calls(tool_name)
+    """)
+    await db.commit()
+    return db
+
+
+async def _record_tool_call(
+    tool_name: str,
+    parameters: dict | None,
+    response: str | None,
+    duration_ms: int,
+    status: str,
+    error_message: str | None,
+    caller_id: str | None,
+    client_name: str | None,
+    client_version: str | None,
+    session_id: str | None,
+    ip_address: str | None,
+) -> None:
+    """Insert a tool call record into the audit DB."""
+    if _audit_db is None:
+        logger.warning("Audit DB not initialized, skipping record")
+        return
+    try:
+        await _audit_db.execute(
+            """INSERT INTO tool_calls
+               (timestamp, tool_name, parameters, response, duration_ms,
+                status, error_message, caller_id, client_name, client_version,
+                session_id, ip_address)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                datetime.now(timezone.utc).isoformat() + "Z",
+                tool_name,
+                json.dumps(parameters) if parameters else None,
+                response[:10000] if response else None,  # cap response size
+                duration_ms,
+                status,
+                error_message,
+                caller_id,
+                client_name,
+                client_version,
+                session_id,
+                ip_address,
+            ),
+        )
+        await _audit_db.commit()
+    except Exception as e:
+        logger.error(f"Failed to record audit: {e}")
+
+
+class AuditMiddleware(Middleware):
+    """Logs every tool call with timing, caller info, and response."""
+
+    async def on_initialize(self, context, call_next):
+        """Capture clientInfo from the initialize handshake."""
+        result = await call_next(context)
+        # Store client info keyed by session once context is available
+        try:
+            ctx = context.fastmcp_context
+            if ctx:
+                sid = ctx.session_id
+                params = context.message
+                client_info = getattr(params, "clientInfo", None)
+                if client_info:
+                    _session_client_info[sid] = {
+                        "name": getattr(client_info, "name", None),
+                        "version": getattr(client_info, "version", None),
+                    }
+                    logger.info(f"Audit: session {sid[:12]}… client={client_info.name}/{client_info.version}")
+        except Exception as e:
+            logger.debug(f"Audit: could not capture clientInfo: {e}")
+        return result
+
+    async def on_call_tool(self, context, call_next):
+        """Wrap every tool call with timing and audit logging."""
+        tool_name = context.message.name
+        parameters = context.message.arguments
+        ctx = context.fastmcp_context
+
+        # Gather identity
+        session_id = None
+        caller_id = None
+        client_name = None
+        client_version = None
+        ip_address = None
+
+        try:
+            if ctx:
+                session_id = ctx.session_id
+                caller_id = ctx.client_id
+                info = _session_client_info.get(session_id, {})
+                client_name = info.get("name")
+                client_version = info.get("version")
+        except Exception:
+            pass
+
+        try:
+            from fastmcp.server.dependencies import get_http_request
+            req = get_http_request()
+            # Starlette Request — check X-Forwarded-For (Cloudflare) then client
+            ip_address = (
+                req.headers.get("x-forwarded-for", "").split(",")[0].strip()
+                or req.headers.get("cf-connecting-ip")
+                or (req.client.host if req.client else None)
+            )
+        except Exception:
+            pass
+
+        t0 = time.monotonic()
+        status = "success"
+        error_message = None
+        response_text = None
+
+        try:
+            result = await call_next(context)
+            # result is a list of TextContent / ImageContent etc.
+            if result:
+                texts = [getattr(c, "text", "") for c in result if hasattr(c, "text")]
+                response_text = "\n".join(texts)
+            return result
+        except Exception as exc:
+            status = "error"
+            error_message = str(exc)
+            raise
+        finally:
+            duration_ms = int((time.monotonic() - t0) * 1000)
+            asyncio.create_task(_record_tool_call(
+                tool_name=tool_name,
+                parameters=parameters,
+                response=response_text,
+                duration_ms=duration_ms,
+                status=status,
+                error_message=error_message,
+                caller_id=caller_id,
+                client_name=client_name,
+                client_version=client_version,
+                session_id=session_id,
+                ip_address=ip_address,
+            ))
+
+mcp.add_middleware(AuditMiddleware())
 
 
 def parse_linkedin_date(date_str: str) -> tuple[datetime, int]:
@@ -651,12 +841,62 @@ async def webhook_save(request: web.Request) -> web.Response:
     return _html_response(data)
 
 
+async def webhook_audit(request: web.Request) -> web.Response:
+    """Query audit log. Params: tool, client, session, last (int), since (ISO datetime)."""
+    if _audit_db is None:
+        return web.json_response({"error": "Audit DB not initialized"}, status=503)
+
+    conditions = []
+    params = []
+
+    tool = request.rel_url.query.get("tool")
+    if tool:
+        conditions.append("tool_name = ?")
+        params.append(tool)
+
+    client = request.rel_url.query.get("client")
+    if client:
+        conditions.append("client_name = ?")
+        params.append(client)
+
+    session = request.rel_url.query.get("session")
+    if session:
+        conditions.append("session_id = ?")
+        params.append(session)
+
+    since = request.rel_url.query.get("since")
+    if since:
+        conditions.append("timestamp >= ?")
+        params.append(since)
+
+    status_filter = request.rel_url.query.get("status")
+    if status_filter:
+        conditions.append("status = ?")
+        params.append(status_filter)
+
+    limit = min(int(request.rel_url.query.get("last", "50")), 500)
+
+    where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+    query = f"SELECT * FROM tool_calls{where} ORDER BY id DESC LIMIT ?"
+    params.append(limit)
+
+    try:
+        cursor = await _audit_db.execute(query, params)
+        columns = [d[0] for d in cursor.description]
+        rows = await cursor.fetchall()
+        records = [dict(zip(columns, row)) for row in rows]
+        return web.json_response({"count": len(records), "records": records})
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+
 async def start_webhook_server():
     app = web.Application()
     app.router.add_get("/status", webhook_status)
     app.router.add_get("/login",  webhook_login)
     app.router.add_get("/login-fill", webhook_login_fill)
     app.router.add_get("/save",   webhook_save)
+    app.router.add_get("/audit",  webhook_audit)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", AUTH_WEBHOOK_PORT)

@@ -61,3 +61,6 @@ nohup.out
 data/private_key.pem
 data/secret
 data/db
+data/audit.db
+data/audit.db-wal
+data/audit.db-shm
