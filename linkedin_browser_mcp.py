@@ -1448,17 +1448,27 @@ def _parse_search_posts(main_text: str) -> list[dict]:
         # Date: relative time pattern in header (before "Follow")
         date_raw = ''
         follow_pos = block.find('\nFollow\n')
-        header = block[:follow_pos] if follow_pos > 0 else block[:300]
+        header = block[:follow_pos] if follow_pos > 0 else block[:500]
         date_m = re.search(r'\n(\d+(?:m|min|h|d|w|mo|yr))\s*(?:•|$)', header, re.MULTILINE)
         if date_m:
             date_raw = date_m.group(1)
         elif re.search(r'just now', header, re.IGNORECASE):
             date_raw = '0m'
 
-        # Content: between "Follow\n" and social action buttons
+        # Content: between "Follow\n" (or date line) and social action buttons
         content = ''
+        content_start = -1
         if follow_pos >= 0:
-            after = block[follow_pos + len('\nFollow\n'):]
+            content_start = follow_pos + len('\nFollow\n')
+        elif date_m:
+            # No "Follow" button (e.g., company page posts you own).
+            # Content starts after the date line "Xm • \n"
+            date_line_end = block.find('\n', date_m.end())
+            if date_line_end >= 0:
+                content_start = date_line_end + 1
+
+        if content_start >= 0:
+            after = block[content_start:]
             end_pos = len(after)
             for pat in [r'\n\d+ reactions?\n', r'\n\d+ comments?\n', r'\nLike\nComment\nRepost\nSend']:
                 m = re.search(pat, after)
