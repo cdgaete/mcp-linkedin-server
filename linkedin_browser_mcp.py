@@ -1,10 +1,12 @@
-from mcp.server import Server
-from mcp.server.stdio import stdio_server
-from mcp.types import Tool, TextContent
+from __future__ import annotations
+
+from fastmcp import FastMCP
+from mcp.types import TextContent
 from playwright.async_api import async_playwright
 import asyncio
 import os
 import json
+from typing import Literal, Optional
 from dotenv import load_dotenv
 from cryptography.fernet import Fernet
 import time
@@ -33,8 +35,16 @@ if env_path.exists():
     load_dotenv(env_path)
     logger.info(f"Loaded environment from {env_path}")
 
-# Create MCP server
-server = Server("linkedin-browser")
+# Create FastMCP server (v3 — streamable HTTP, no restart needed on code changes)
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(server):
+    """Start the auth webhook server alongside the MCP server."""
+    await start_webhook_server()
+    yield
+
+mcp = FastMCP("linkedin-browser", lifespan=lifespan)
 
 # --- Async task store for long-running search operations ---
 import uuid as _uuid
@@ -317,197 +327,103 @@ class BrowserSession:
         return page
 
 
-# Define tools
-@server.list_tools()
-async def list_tools():
-    return [
-        Tool(
-            name="login_linkedin",
-            description="Step 1 of 2: Open LinkedIn login page in a visible browser window. Returns immediately — do NOT wait. After finishing manual login, call login_linkedin_save to capture the session.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "account": {"type": "string", "enum": ["carlos", "claudia"], "default": "carlos", "description": "Account to login (carlos=EcoSemantic, claudia=personal)"}
-                },
-                "required": []
-            }
-        ),
-        Tool(
-            name="login_linkedin_save",
-            description="Step 2 of 2: Call this after finishing manual login in the browser opened by login_linkedin. Saves session cookies and closes the browser.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "account": {"type": "string", "enum": ["carlos", "claudia"], "default": "carlos", "description": "Account that was logged in"}
-                },
-                "required": []
-            }
-        ),
-        Tool(
-            name="browse_linkedin_feed",
-            description="Browse LinkedIn feed and return recent posts. Use max_age_days to filter old posts.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "count": {"type": "integer", "default": 5, "description": "Number of posts to retrieve"},
-                    "max_age_days": {"type": "integer", "default": 0, "description": "Maximum age in days (0 = no filter, 7 = last week)"}
-                },
-                "required": []
-            }
-        ),
-        Tool(
-            name="search_linkedin_profiles",
-            description="Search for LinkedIn profiles matching a query",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Search query"},
-                    "count": {"type": "integer", "default": 5}
-                },
-                "required": ["query"]
-            }
-        ),
-        Tool(
-            name="search_linkedin_posts",
-            description="Search for LinkedIn posts by keywords. Use max_age_days to filter old posts.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Search keywords"},
-                    "count": {"type": "integer", "default": 5, "description": "Number of posts to retrieve"},
-                    "max_age_days": {"type": "integer", "default": 0, "description": "Maximum age in days (0 = no filter, 7 = last week)"}
-                },
-                "required": ["query"]
-            }
-        ),
-        Tool(
-            name="search_linkedin_posts_async",
-            description="Start a LinkedIn post search in the background. Returns a task_id immediately. Poll get_search_task_status with the task_id to retrieve results when done (~9s).",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Search keywords"},
-                    "count": {"type": "integer", "default": 5, "description": "Number of posts to retrieve"},
-                    "max_age_days": {"type": "integer", "default": 0, "description": "Maximum age in days (0 = no filter, 7 = last week)"}
-                },
-                "required": ["query"]
-            }
-        ),
-        Tool(
-            name="get_search_task_status",
-            description="Poll the status of a search_linkedin_posts_async task. Returns status=pending while running, status=done with full posts list when complete, or status=error.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "task_id": {"type": "string", "description": "Task ID returned by search_linkedin_posts_async"}
-                },
-                "required": ["task_id"]
-            }
-        ),
-        Tool(
-            name="view_linkedin_profile",
-            description="Visit and extract data from a LinkedIn profile URL",
-            inputSchema={
-                "type": "object",
-                "properties": {"profile_url": {"type": "string", "description": "LinkedIn profile URL"}},
-                "required": ["profile_url"]
-            }
-        ),
-        Tool(
-            name="get_linkedin_posts",
-            description="Get posts from a LinkedIn profile or company page with their URLs and URNs. Pass a full URL, a path like 'company/ecosemantic' or 'in/carlosgaete', or just a slug like 'ecosemantic'.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "profile_url": {"type": "string", "description": "LinkedIn profile or company URL/slug (e.g. 'ecosemantic', 'company/ecosemantic', or full URL)"},
-                    "count": {"type": "integer", "default": 5, "description": "Number of posts to retrieve"}
-                },
-                "required": ["profile_url"]
-            }
-        ),
-        Tool(
-            name="interact_with_linkedin_post",
-            description="Interact with a LinkedIn post (like, comment, or read). Use 'account' to select which LinkedIn account (carlos or claudia). Use 'company_id' to like/comment as a company page (auto-set for carlos from env, or pass explicitly).",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "post_url": {"type": "string", "description": "LinkedIn post URL"},
-                    "action": {"type": "string", "enum": ["like", "comment", "read"], "default": "read"},
-                    "comment": {"type": "string", "description": "Comment text (required if action is 'comment')"},
-                    "account": {"type": "string", "enum": ["carlos", "claudia"], "description": "Which account to use (carlos=EcoSemantic, claudia=personal)"},
-                    "company_id": {"type": "string", "description": "Company/Showcase ID to like/comment as (auto-set for carlos = EcoSemantic). Pass a specific ID to use a different page. Pass \"personal\" to force acting as the personal account instead of company."}
-                },
-                "required": ["post_url"]
-            }
-        )
-    ]
+# ---------------------------------------------------------------------------
+# FastMCP tool definitions
+# Each @mcp.tool() wraps the existing do_* handlers.
+# do_* functions return [TextContent(...)]; we extract .text for FastMCP.
+# ---------------------------------------------------------------------------
+
+def _extract(result: list) -> str:
+    """Extract text from legacy [TextContent(...)] return values."""
+    return result[0].text if result else "{}"
 
 
-@server.call_tool()
-async def call_tool(name: str, arguments: dict):
-    try:
-        if name == "login_linkedin":
-            return await do_login_start(arguments.get("account", "carlos"))
-        elif name == "login_linkedin_save":
-            return await do_login_save(arguments.get("account", "carlos"))
-        elif name == "browse_linkedin_feed":
-            return await do_browse_feed(
-                arguments.get("count", 5),
-                arguments.get("max_age_days", 0)
-            )
-        elif name == "search_linkedin_profiles":
-            return await do_search_profiles(arguments["query"], arguments.get("count", 5))
-        elif name == "search_linkedin_posts":
-            return await do_search_posts(
-                arguments["query"],
-                arguments.get("count", 5),
-                arguments.get("max_age_days", 0)
-            )
-        elif name == "search_linkedin_posts_async":
-            task_id = str(_uuid.uuid4())
-            _search_tasks[task_id] = {"status": "pending", "result": None}
-            async def _run_search(tid, q, c, m):
-                try:
-                    result = await do_search_posts(q, c, m)
-                    _search_tasks[tid] = {"status": "done", "result": json.loads(result[0].text)}
-                except Exception as e:
-                    _search_tasks[tid] = {"status": "error", "result": {"message": str(e)}}
-            asyncio.create_task(_run_search(task_id, arguments["query"], arguments.get("count", 5), arguments.get("max_age_days", 0)))
-            return [TextContent(type="text", text=json.dumps({"task_id": task_id, "status": "pending"}))]
-        elif name == "get_search_task_status":
-            task_id = arguments["task_id"]
-            task = _search_tasks.get(task_id)
-            if not task:
-                return [TextContent(type="text", text=json.dumps({"status": "error", "message": f"Unknown task_id: {task_id}"}))]
-            return [TextContent(type="text", text=json.dumps({"task_id": task_id, **task}))]
-        elif name == "get_linkedin_posts":
-            return await do_get_posts(arguments["profile_url"], arguments.get("count", 5))
-        elif name == "view_linkedin_profile":
-            return await do_view_profile(arguments["profile_url"])
-        elif name == "interact_with_linkedin_post":
-            # Determine account and company_id
-            account = arguments.get("account", "carlos")
-            company_id = arguments.get("company_id")
+@mcp.tool()
+async def login_linkedin(account: Literal["carlos", "claudia"] = "carlos") -> str:
+    """Step 1 of 2: Open LinkedIn login page in a visible browser window. Returns immediately — do NOT wait. After finishing manual login, call login_linkedin_save to capture the session."""
+    return _extract(await do_login_start(account))
 
-            # "personal" is a sentinel to force personal identity (no company)
-            if company_id and company_id.lower() == "personal":
-                company_id = None
-            # Auto-set company_id for carlos only if not explicitly provided
-            elif account == "carlos" and company_id is None:
-                company_id = LINKEDIN_ACCOUNTS["carlos"]["company_id"]
-            
-            return await do_interact_post(
-                arguments["post_url"],
-                arguments.get("action", "read"),
-                arguments.get("comment"),
-                company_id,
-                account
-            )
-        else:
-            return [TextContent(type="text", text=f"Unknown tool: {name}")]
-    except Exception as e:
-        logger.error(f"Tool error: {e}")
-        return [TextContent(type="text", text=json.dumps({"status": "error", "message": str(e)}))]
+
+@mcp.tool()
+async def login_linkedin_save(account: Literal["carlos", "claudia"] = "carlos") -> str:
+    """Step 2 of 2: Call this after finishing manual login in the browser opened by login_linkedin. Saves session cookies and closes the browser."""
+    return _extract(await do_login_save(account))
+
+
+@mcp.tool()
+async def browse_linkedin_feed(count: int = 5, max_age_days: int = 0) -> str:
+    """Browse LinkedIn feed and return recent posts. Use max_age_days to filter old posts."""
+    return _extract(await do_browse_feed(count, max_age_days))
+
+
+@mcp.tool()
+async def search_linkedin_profiles(query: str, count: int = 5) -> str:
+    """Search for LinkedIn profiles matching a query."""
+    return _extract(await do_search_profiles(query, count))
+
+
+@mcp.tool()
+async def search_linkedin_posts(query: str, count: int = 5, max_age_days: int = 0) -> str:
+    """Search for LinkedIn posts by keywords. Use max_age_days to filter old posts."""
+    return _extract(await do_search_posts(query, count, max_age_days))
+
+
+@mcp.tool()
+async def search_linkedin_posts_async(query: str, count: int = 5, max_age_days: int = 0) -> str:
+    """Start a LinkedIn post search in the background. Returns a task_id immediately. Poll get_search_task_status with the task_id to retrieve results when done (~9s)."""
+    task_id = str(_uuid.uuid4())
+    _search_tasks[task_id] = {"status": "pending", "result": None}
+
+    async def _run_search(tid, q, c, m):
+        try:
+            result = await do_search_posts(q, c, m)
+            _search_tasks[tid] = {"status": "done", "result": json.loads(result[0].text)}
+        except Exception as e:
+            _search_tasks[tid] = {"status": "error", "result": {"message": str(e)}}
+
+    asyncio.create_task(_run_search(task_id, query, count, max_age_days))
+    return json.dumps({"task_id": task_id, "status": "pending"})
+
+
+@mcp.tool()
+async def get_search_task_status(task_id: str) -> str:
+    """Poll the status of a search_linkedin_posts_async task. Returns status=pending while running, status=done with full posts list when complete, or status=error."""
+    task = _search_tasks.get(task_id)
+    if not task:
+        return json.dumps({"status": "error", "message": f"Unknown task_id: {task_id}"})
+    return json.dumps({"task_id": task_id, **task})
+
+
+@mcp.tool()
+async def view_linkedin_profile(profile_url: str) -> str:
+    """Visit and extract data from a LinkedIn profile URL."""
+    return _extract(await do_view_profile(profile_url))
+
+
+@mcp.tool()
+async def get_linkedin_posts(profile_url: str, count: int = 5) -> str:
+    """Get posts from a LinkedIn profile or company page with their URLs and URNs. Pass a full URL, a path like 'company/ecosemantic' or 'in/carlosgaete', or just a slug like 'ecosemantic'."""
+    return _extract(await do_get_posts(profile_url, count))
+
+
+@mcp.tool()
+async def interact_with_linkedin_post(
+    post_url: str,
+    action: Literal["like", "comment", "read"] = "read",
+    comment: Optional[str] = None,
+    account: Literal["carlos", "claudia"] = "carlos",
+    company_id: Optional[str] = None,
+) -> str:
+    """Interact with a LinkedIn post (like, comment, or read). Use 'account' to select which LinkedIn account (carlos or claudia). Use 'company_id' to like/comment as a company page (auto-set for carlos = EcoSemantic). Pass 'personal' to force acting as the personal account instead of company."""
+    # "personal" is a sentinel to force personal identity (no company)
+    resolved_company = company_id
+    if resolved_company and resolved_company.lower() == "personal":
+        resolved_company = None
+    # Auto-set company_id for carlos only if not explicitly provided
+    elif account == "carlos" and resolved_company is None:
+        resolved_company = LINKEDIN_ACCOUNTS["carlos"]["company_id"]
+
+    return _extract(await do_interact_post(post_url, action, comment, resolved_company, account))
 
 
 
@@ -1741,67 +1657,12 @@ async def do_interact_post(post_url: str, action: str, comment: str = None, comp
         }, indent=2))]
 
 
-async def main():
-    """Run the MCP server with stdio transport and auth webhook server."""
-    await start_webhook_server()
-    async with stdio_server() as (read_stream, write_stream):
-        await server.run(read_stream, write_stream, server.create_initialization_options())
-
-
-async def main_http(api_key: str, port: int = 8989):
-    """Run MCP over SSE/HTTP with bearer token auth + webhook server."""
-    from starlette.applications import Starlette
-    from starlette.routing import Mount, Route
-    from starlette.responses import Response
-    from mcp.server.sse import SseServerTransport
-    import uvicorn
-
-    sse = SseServerTransport("/mcp/messages")
-
-    async def handle_sse(request):
-        # Auth check: bearer header or ?token= query param
-        auth = request.headers.get("Authorization", "")
-        token_param = request.query_params.get("token", "")
-        if auth != f"Bearer {api_key}" and token_param != api_key:
-            return Response('{"error":"Unauthorized"}', status_code=401,
-                            media_type="application/json")
-        async with sse.connect_sse(request.scope, request.receive, request._send) as (r, w):
-            await server.run(r, w, server.create_initialization_options())
-        return Response()
-
-    async def handle_messages(scope, receive, send):
-        # Auth check for POST messages endpoint
-        from starlette.requests import Request
-        request = Request(scope, receive)
-        auth = request.headers.get("Authorization", "")
-        token_param = request.query_params.get("token", "")
-        if auth != f"Bearer {api_key}" and token_param != api_key:
-            resp = Response('{"error":"Unauthorized"}', status_code=401,
-                            media_type="application/json")
-            await resp(scope, receive, send)
-            return
-        await sse.handle_post_message(scope, receive, send)
-
-    starlette_app = Starlette(
-        routes=[
-            Route("/mcp/sse", endpoint=handle_sse),
-            Mount("/mcp/messages", app=handle_messages),
-        ],
-    )
-
-    await start_webhook_server()
-    logger.info(f"LinkedIn MCP HTTP server on port {port}")
-
-    config = uvicorn.Config(starlette_app, host="0.0.0.0", port=port, log_level="warning")
-    uv_server = uvicorn.Server(config)
-    await uv_server.serve()
 
 
 if __name__ == "__main__":
-    if "--http" in sys.argv:
-        idx = sys.argv.index("--http")
-        api_key = sys.argv[idx + 1] if idx + 1 < len(sys.argv) else ""
-        port = int(sys.argv[sys.argv.index("--port") + 1]) if "--port" in sys.argv else 8989
-        asyncio.run(main_http(api_key, port))
-    else:
-        asyncio.run(main())
+    port = int(sys.argv[sys.argv.index("--port") + 1]) if "--port" in sys.argv else 8988
+    mcp.run(
+        transport="streamable-http",
+        host="0.0.0.0",
+        port=port,
+    )
