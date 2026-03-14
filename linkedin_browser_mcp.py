@@ -1939,12 +1939,11 @@ async def do_interact_post(post_url: str, action: str, comment: str = None, comp
 async def do_create_post(content: str, company_id: str = None, account: str = None):
     """Create a new LinkedIn post, optionally as a company page.
 
-    Flow:
-      1. Navigate to feed
-      2. Click "Start a post" to open the editor modal
-      3. If company_id is set, switch identity in the editor modal
-      4. Type content into the editor
-      5. Click Post
+    Proven flow (tested step-by-step):
+      1. Navigate to /feed/, click "Start a post"
+      2. If company_id: settings button > actor toggle > select radio > Save > Done
+      3. Type content into ql-editor via keyboard.type()
+      4. Click Post button (share-actions__primary-action)
     """
     if not content or not content.strip():
         return [TextContent(type="text", text=json.dumps({"status": "error", "message": "Post content cannot be empty"}))]
@@ -1961,171 +1960,103 @@ async def do_create_post(content: str, company_id: str = None, account: str = No
         await page.wait_for_timeout(3000)
 
         # --- Step 1: Open the post editor modal ---
-        try:
-            # LinkedIn has a share box at the top with "Start a post" button
-            start_btn = page.locator(
-                'button:has-text("Start a post"), '
-                'button.share-box-feed-entry__trigger, '
-                'button[aria-label*="Start a post"]'
-            )
-            if await start_btn.count() == 0:
-                await save_cookies(page)
-                return [TextContent(type="text", text=json.dumps({"status": "error", "message": "Could not find 'Start a post' button"}))]
-
-            await start_btn.first.click()
-            await page.wait_for_timeout(2000)
-            logger.info("Clicked 'Start a post' — waiting for editor modal")
-        except Exception as e:
+        start_btn = page.locator('button:has-text("Start a post")')
+        if await start_btn.count() == 0:
             await save_cookies(page)
-            return [TextContent(type="text", text=json.dumps({"status": "error", "message": f"Failed to open post editor: {e}"}))]
+            return [TextContent(type="text", text=json.dumps({"status": "error", "message": "Could not find 'Start a post' button"}))]
+
+        await start_btn.first.click()
+        await page.wait_for_timeout(2000)
+        logger.info("Opened post editor modal")
 
         # --- Step 2: Switch identity if company page requested ---
         if company_id:
             try:
-                # The post editor modal has an identity dropdown at the top
-                # Look for the profile/identity area that shows current poster name
-                identity_trigger = page.locator(
-                    'button[class*="sharing-post-creation-header__author-trigger"], '
-                    'button[aria-label*="Post as"], '
-                    'div.share-creation-state__header button, '
-                    'button[class*="post-creation-header"]'
-                )
+                # 2a. Open Post settings
+                await page.locator('button.share-unified-settings-entry-button').first.click()
+                await page.wait_for_timeout(1500)
 
-                if await identity_trigger.count() > 0:
-                    await identity_trigger.first.click()
-                    await page.wait_for_timeout(1500)
-                    logger.info("Opened identity switcher in post editor")
+                # 2b. Click author name to open "Posting as"
+                await page.locator('button.share-unified-settings-menu__actor-toggle').first.click()
+                await page.wait_for_timeout(1500)
 
-                    # Try to find the company option — similar to the like/comment switcher
-                    # but the post creation modal may use different selectors
-                    company_radio = await page.evaluate("""() => {
-                        // Check for actorSelector radios (same pattern as like/comment)
-                        const radios = document.querySelectorAll('input[name="actorSelector"], input[type="radio"]');
-                        for (const r of radios) {
-                            if (r.id === 'select-self') continue;
-                            const li = r.closest('li') || r.closest('[role="option"]') || r.parentElement;
-                            if (!li) continue;
-                            const text = li.innerText.toLowerCase();
-                            if (text.includes('ecosemantic')) return r.id;
-                        }
-                        // Fallback: pick the first non-self radio
-                        for (const r of radios) {
-                            if (r.id !== 'select-self' && r.id) return r.id;
-                        }
-                        return null;
-                    }""")
+                # 2c. Find and click the target radio by label text
+                target_label = "ecosemantic"  # default
+                radio_id = await page.evaluate(f"""(target) => {{
+                    const radios = document.querySelectorAll('input[type="radio"]');
+                    for (const r of radios) {{
+                        const li = r.closest('li') || r.parentElement;
+                        if (li && li.innerText.toLowerCase().includes(target)) return r.id;
+                    }}
+                    return null;
+                }}""", target_label)
 
-                    if company_radio:
-                        await page.evaluate(f"document.getElementById('{company_radio}').click()")
-                        await page.wait_for_timeout(800)
-                        # Click Save / Next / Done — whatever the confirm button is
-                        save_btn = page.locator(
-                            'button[aria-label="Save selection"]:not([disabled]), '
-                            'button:has-text("Save"):not([disabled]), '
-                            'button:has-text("Next"):not([disabled]), '
-                            'button:has-text("Done"):not([disabled])'
-                        )
-                        try:
-                            await save_btn.first.wait_for(state='visible', timeout=3000)
-                            await save_btn.first.click()
-                            await page.wait_for_timeout(1500)
-                            logger.info(f"Switched post identity to {company_radio}")
-                        except Exception as save_err:
-                            logger.warning(f"Identity save button issue: {save_err}")
-                    else:
-                        logger.warning("Could not find company radio in post editor identity modal")
+                if radio_id:
+                    await page.evaluate(f"document.getElementById('{radio_id}').click()")
+                    await page.wait_for_timeout(800)
+
+                    # 2d. Click Save (becomes enabled after radio change)
+                    save_btn = page.locator('button.share-box-footer__primary-btn:has-text("Save")')
+                    await save_btn.first.click()
+                    await page.wait_for_timeout(2000)
+
+                    # 2e. Click Done to return to editor
+                    await page.locator('button:has-text("Done")').first.click()
+                    await page.wait_for_timeout(2000)
+                    logger.info(f"Switched identity to {target_label} ({radio_id})")
                 else:
-                    logger.warning("Could not find identity trigger in post editor — posting as default identity")
+                    logger.warning(f"Could not find radio for '{target_label}' — posting as default identity")
+                    # Go back to editor
+                    await page.locator('button:has-text("Back")').first.click()
+                    await page.wait_for_timeout(500)
+                    await page.locator('button:has-text("Done")').first.click()
+                    await page.wait_for_timeout(1000)
             except Exception as e:
-                logger.warning(f"Identity switching failed: {e} — continuing as default identity")
+                logger.warning(f"Identity switching failed: {e} — attempting to continue")
 
         # --- Step 3: Type the post content ---
-        try:
-            editor = page.locator(
-                'div.ql-editor[contenteditable="true"], '
-                'div[role="textbox"][contenteditable="true"], '
-                'div[aria-label*="Text editor"][contenteditable="true"], '
-                'div[data-placeholder*="What do you want to talk about"]'
-            )
-
-            if await editor.count() == 0:
-                # Try broader search
-                editor = page.locator('div[contenteditable="true"]')
-
-            if await editor.count() == 0:
-                await save_cookies(page)
-                return [TextContent(type="text", text=json.dumps({"status": "error", "message": "Could not find post editor text area"}))]
-
-            await editor.first.click()
-            await page.wait_for_timeout(500)
-
-            # Use keyboard.type for natural typing (handles newlines, emojis better than fill)
-            await page.keyboard.type(content, delay=20)
-            await page.wait_for_timeout(1000)
-            logger.info(f"Typed post content ({len(content)} chars)")
-        except Exception as e:
+        editor = page.locator('div.ql-editor[role="textbox"]')
+        if await editor.count() == 0:
             await save_cookies(page)
-            return [TextContent(type="text", text=json.dumps({"status": "error", "message": f"Failed to type post content: {e}"}))]
+            return [TextContent(type="text", text=json.dumps({"status": "error", "message": "Could not find post editor"}))]
 
-        # --- Step 4: Click the Post button ---
-        try:
-            post_btn = page.locator(
-                'button.share-actions__primary-action:not([disabled]), '
-                'button[aria-label="Post"]:not([disabled]), '
-                'button:has-text("Post"):not([disabled])'
-            )
+        await editor.first.click()
+        await page.wait_for_timeout(300)
+        await page.keyboard.type(content, delay=20)
+        await page.wait_for_timeout(1000)
+        logger.info(f"Typed post content ({len(content)} chars)")
 
-            if await post_btn.count() == 0:
-                await page.wait_for_timeout(2000)
-                post_btn = page.locator(
-                    'button.share-actions__primary-action:not([disabled]), '
-                    'button[aria-label="Post"]:not([disabled])'
-                )
+        # --- Step 4: Click Post ---
+        post_btn = page.locator('button.share-actions__primary-action')
+        if await post_btn.first.is_disabled():
+            await page.wait_for_timeout(2000)
 
-            if await post_btn.count() == 0:
-                # Debug: dump available buttons
-                buttons = await page.evaluate("""() => {
-                    return Array.from(document.querySelectorAll('button')).map(b => ({
-                        text: b.innerText.trim().substring(0, 40),
-                        class: b.className.substring(0, 60),
-                        disabled: b.disabled,
-                        ariaLabel: b.getAttribute('aria-label')
-                    })).filter(b => b.text.toLowerCase().includes('post') || (b.ariaLabel && b.ariaLabel.toLowerCase().includes('post')));
-                }""")
-                logger.error(f"No Post button found. Candidates: {json.dumps(buttons)}")
-                await save_cookies(page)
-                return [TextContent(type="text", text=json.dumps({"status": "error", "message": "Could not find enabled Post button", "debug_buttons": buttons}))]
-
-            await post_btn.first.click()
-            logger.info("Clicked Post button")
-            await page.wait_for_timeout(5000)
-
-            # Verify: check if the modal closed (post published)
-            modal_still_open = await page.locator(
-                'div.share-creation-state, div[aria-label*="Post editor"]'
-            ).count() > 0
-
-            actor = f"company:{company_id}" if company_id else f"personal:{account}"
-            if not modal_still_open:
-                await save_cookies(page)
-                return [TextContent(type="text", text=json.dumps({
-                    "status": "success",
-                    "action": "create_post",
-                    "message": f"Post published as {actor}",
-                    "content_preview": content[:100]
-                }))]
-            else:
-                await save_cookies(page)
-                return [TextContent(type="text", text=json.dumps({
-                    "status": "uncertain",
-                    "action": "create_post",
-                    "message": f"Post button clicked as {actor} but editor modal may still be open"
-                }))]
-
-        except Exception as e:
-            logger.error(f"Post submission error: {e}")
+        if await post_btn.first.is_disabled():
             await save_cookies(page)
-            return [TextContent(type="text", text=json.dumps({"status": "error", "message": f"Failed to submit post: {e}"}))]
+            return [TextContent(type="text", text=json.dumps({"status": "error", "message": "Post button still disabled after typing"}))]
+
+        await post_btn.first.click()
+        logger.info("Clicked Post button")
+        await page.wait_for_timeout(5000)
+
+        # Verify: modal should close after successful post
+        dialog_count = await page.locator('[role="dialog"]').count()
+        actor = f"company:{company_id}" if company_id else f"personal:{account}"
+        await save_cookies(page)
+
+        if dialog_count == 0:
+            return [TextContent(type="text", text=json.dumps({
+                "status": "success",
+                "action": "create_post",
+                "message": f"Post published as {actor}",
+                "content_preview": content[:100]
+            }))]
+        else:
+            return [TextContent(type="text", text=json.dumps({
+                "status": "uncertain",
+                "action": "create_post",
+                "message": f"Post button clicked as {actor} but dialog may still be open"
+            }))]
 
 
 if __name__ == "__main__":
