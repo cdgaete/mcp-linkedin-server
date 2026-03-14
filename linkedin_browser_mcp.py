@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from fastmcp import FastMCP
+from fastmcp.server.auth import AccessToken, TokenVerifier
 from mcp.types import TextContent
 from playwright.async_api import async_playwright
 import asyncio
@@ -35,6 +36,29 @@ if env_path.exists():
     load_dotenv(env_path)
     logger.info(f"Loaded environment from {env_path}")
 
+# ---------------------------------------------------------------------------
+# Bearer token auth for FastMCP v3
+# ---------------------------------------------------------------------------
+class BearerAuth(TokenVerifier):
+    """Simple static bearer token verifier."""
+    def __init__(self, token: str):
+        super().__init__()
+        self._token = token
+
+    async def verify_token(self, token: str) -> AccessToken | None:
+        if token == self._token:
+            return AccessToken(token=token, client_id="linkedin-mcp", scopes=[])
+        return None
+
+# Read bearer token from --http arg (legacy compat) or MCP_BEARER_TOKEN env
+_bearer_token = os.getenv("MCP_BEARER_TOKEN", "")
+if "--http" in sys.argv:
+    _idx = sys.argv.index("--http")
+    if _idx + 1 < len(sys.argv):
+        _bearer_token = sys.argv[_idx + 1]
+
+_auth = BearerAuth(_bearer_token) if _bearer_token else None
+
 # Create FastMCP server (v3 — streamable HTTP, no restart needed on code changes)
 from contextlib import asynccontextmanager
 
@@ -44,7 +68,7 @@ async def lifespan(server):
     await start_webhook_server()
     yield
 
-mcp = FastMCP("linkedin-browser", lifespan=lifespan)
+mcp = FastMCP("linkedin-browser", lifespan=lifespan, auth=_auth)
 
 # --- Async task store for long-running search operations ---
 import uuid as _uuid
